@@ -110,8 +110,11 @@ func OperationMessageContains(text string) Expectation {
 func OperationRetriedMinimumTimes(minRetries int64) Expectation {
 	return func(c *Consequences) (state, string) {
 		operationState := c.app().Status.OperationState
+		if operationState == nil {
+			return pending, "no operation state yet"
+		}
 		actual := operationState.RetryCount
-		message := fmt.Sprintf("operation state retry cound should be at least %d, is %d, message: '%s'", minRetries, actual, operationState.Message)
+		message := fmt.Sprintf("operation state retry count should be at least %d, is %d, message: '%s'", minRetries, actual, operationState.Message)
 		return simple(actual >= minRetries, message)
 	}
 }
@@ -160,6 +163,17 @@ func HydrationPhaseIs(expected v1alpha1.HydrateOperationPhase) Expectation {
 	return func(c *Consequences) (state, string) {
 		actual := c.app().Status.SourceHydrator.CurrentOperation.Phase
 		return simple(actual == expected, fmt.Sprintf("hydration phase to be %s, is %s", expected, actual))
+	}
+}
+
+func HydrationDrySHAIs(expected string) Expectation {
+	return func(c *Consequences) (state, string) {
+		op := c.app().Status.SourceHydrator.CurrentOperation
+		actual := ""
+		if op != nil {
+			actual = op.DrySHA
+		}
+		return simple(actual == expected, fmt.Sprintf("hydration dry SHA to be %s, is %s", expected, actual))
 	}
 }
 

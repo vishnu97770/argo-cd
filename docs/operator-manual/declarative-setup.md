@@ -331,6 +331,41 @@ stringData:
   azureServicePrincipalClientSecret: XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 ```
 
+Example for an OCI repository holding plain manifests, Kustomize directories or Helm charts as OCI artifacts (see [OCI](../user-guide/oci.md)), with `type: oci` and an `oci://` URL:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: private-oci-repo
+  namespace: argocd
+  labels:
+    argocd.argoproj.io/secret-type: repository
+stringData:
+  url: oci://my.registry.com/namespace/service
+  type: oci
+  username: my-username
+  password: my-password
+```
+
+A registry served over plain HTTP, such as a local registry in a test cluster, must be marked with `insecureOCIForceHttp: "true"` (the CLI flag is `--insecure-oci-force-http`); otherwise Argo CD connects with TLS and the connection fails. The field applies to `type: oci` repositories and to Helm repositories with `enableOCI: "true"`. Since Argo CD 3.5, a plain-HTTP registry that a chart's OCI dependencies come from needs its own repository secret with this field as well.
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: local-oci-repo
+  namespace: argocd
+  labels:
+    argocd.argoproj.io/secret-type: repository
+stringData:
+  url: oci://registry.kube-system.svc:5000/releases
+  type: oci
+  insecureOCIForceHttp: "true"
+```
+
+`insecureOCIForceHttp` disables TLS entirely; `insecure` keeps TLS but skips certificate verification. For a `type: oci` repository Argo CD's own OCI client honours both settings independently. For Helm, see the note under [Helm](#helm) before combining them.
+
 ### Repository Credentials
 
 If you want to use the same credentials for multiple repositories, you can configure credential templates. Credential templates can carry the same credentials information as repositories.
@@ -400,6 +435,16 @@ The following keys are valid to refer to credential secrets:
 * `githubAppInstallationID` refers to the Installation ID of the GitHub app you created and installed.
 * `githubAppEnterpriseBaseUrl` refers to the base api URL for GitHub Enterprise (e.g. `https://ghe.example.com/api/v3`)
 * `tlsClientCertData` and `tlsClientCertKey` refer to secrets where a TLS client certificate (`tlsClientCertData`) and the corresponding private key `tlsClientCertKey` are stored for accessing GitHub Enterprise if custom certificates are used.
+
+#### Azure Service Principal repositories
+
+* `azureServicePrincipalClientID` or `azureServicePrincipalClientId` refers to the client ID.
+* `azureServicePrincipalTenantID` or `azureServicePrincipalTenantId` refers to the tenant ID.
+* `azureServicePrincipalClientSecret` refers to the client secret.
+* `azureActiveDirectoryEndpoint` optionally specifies the Microsoft Entra authority endpoint.
+
+> [!NOTE]
+> If both forms of a client or tenant ID key have values, the uppercase-`ID` form takes precedence.
 
 #### Helm Chart repositories
 
@@ -596,6 +641,10 @@ tlsClientConfig:
     serverName: string
 # Disable automatic compression for requests to the cluster 
 disableCompression: boolean
+# Optional QPS limit for K8s API client requests to this cluster. If unset or <= 0, defaults to the controller's global ARGOCD_K8S_CLIENT_QPS.
+qps: float
+# Optional Burst limit for K8s API client requests to this cluster. If unset or <= 0, defaults to 2 * qps (if qps is set) or the controller's global ARGOCD_K8S_CLIENT_BURST.
+burst: integer
 ```
 
 > [!IMPORTANT]
@@ -1267,6 +1316,50 @@ stringData:
     }
 ```
 
+### Generic OIDC
+
+For a cluster whose API server is configured to trust an external OIDC issuer (`--oidc-issuer-url`), the `oidc` command emits a pre-issued token as the credential. A common source is a projected ServiceAccount token whose audience matches the API server's configured client ID; the token file is re-read on each invocation, so rotation is handled automatically and no long-lived credential is stored.
+
+The token file path is set with `--token-file` or the `ARGOCD_OIDC_TOKEN_FILE` environment variable.
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mycluster-secret
+  labels:
+    argocd.argoproj.io/secret-type: cluster
+type: Opaque
+stringData:
+  name: mycluster.example.com
+  server: https://mycluster.example.com
+  config: |
+    {
+      "execProviderConfig": {
+        "command": "argocd-k8s-auth",
+        "args": ["oidc", "--token-file", "/var/run/secrets/oidc/token"],
+        "apiVersion": "client.authentication.k8s.io/v1beta1"
+      },
+      "tlsClientConfig": {
+        "insecure": false,
+        "caData": "<base64 encoded certificate>"
+      }
+    }
+```
+
+To project a ServiceAccount token with the required audience, mount it on the `argocd-application-controller` and `argocd-server` pods, for example:
+
+```yaml
+volumes:
+  - name: oidc-token
+    projected:
+      sources:
+        - serviceAccountToken:
+            path: token
+            audience: <api server oidc client id>
+            expirationSeconds: 3600
+```
+
 ## Helm
 
 Helm charts can be sourced from a Helm repository or OCI registry.
@@ -1348,6 +1441,11 @@ stringData:
   type: helm
   enableOCI: "true"
 ```
+
+For an OCI registry served over plain HTTP, set `insecureOCIForceHttp: "true"` as well; see [Repositories](#repositories).
+
+> [!NOTE]
+> With Helm v4, do not set `insecure` and `insecureOCIForceHttp` together: `insecure` (`--insecure-skip-tls-verify`) takes precedence and the plain-HTTP setting (`--plain-http`) is silently dropped. This applies to a Helm repository that sets both, and across a dependency chain: a chart repository with `insecure` whose OCI dependencies come from a registry with `insecureOCIForceHttp` fails at `helm dependency build`. Use `insecure` for HTTPS registries with self-signed certificates and `insecureOCIForceHttp` for plain-HTTP registries, and do not mix the two within one chart and its dependencies. This limitation is Helm's; `type: oci` repositories that hold plain manifests or Kustomize are not affected.
 
 ## Resource Exclusion/Inclusion
 

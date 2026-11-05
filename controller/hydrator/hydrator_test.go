@@ -1028,6 +1028,29 @@ func TestValidateApplications_DuplicateDestination(t *testing.T) {
 	require.ErrorContains(t, errs[app2.QualifiedName()], "app default/app1 hydrator uses the same destination")
 }
 
+func TestValidateApplications_DuplicateDestination_EquivalentPaths(t *testing.T) {
+	t.Parallel()
+	for _, path := range []string{"app/", "./app", "other/../app", "app//"} {
+		t.Run(path, func(t *testing.T) {
+			t.Parallel()
+			d := mocks.NewDependencies(t)
+			app1 := newTestApp("app1")
+			app2 := newTestApp("app2")
+			app2.Spec.SourceHydrator.SyncSource.Path = path // same directory as app1's "app"
+			proj := newTestProject()
+			d.EXPECT().GetProcessableAppProj(app1).Return(proj, nil).Once()
+			d.EXPECT().GetProcessableAppProj(app2).Return(proj, nil).Once()
+			h := &Hydrator{dependencies: d}
+
+			projects, errs := h.validateApplications([]*v1alpha1.Application{app1, app2})
+			require.Nil(t, projects)
+			require.Len(t, errs, 2)
+			require.ErrorContains(t, errs[app1.QualifiedName()], "app default/app2 hydrator uses the same destination")
+			require.ErrorContains(t, errs[app2.QualifiedName()], "app default/app1 hydrator uses the same destination")
+		})
+	}
+}
+
 func TestValidateApplications_DifferentDestinationRepo_Success(t *testing.T) {
 	t.Parallel()
 	d := mocks.NewDependencies(t)
@@ -1934,10 +1957,11 @@ func TestProcessAppHydrateQueueItem_AdvancesNote_WhenDrySHAMovedButNoManifestCha
 	app.Status.SourceHydrator.LastComparedDryRevision = "new-dry-sha"
 
 	// EvaluateAppRevisionsChanges says: no changes, resolved revision = "new-dry-sha".
-	d.EXPECT().GetProcessableAppProj(mock.Anything).Return(proj, nil).Once()
+	d.EXPECT().GetProcessableAppProj(mock.Anything).Return(proj, nil).Times(2)
 	drySource := app.Spec.SourceHydrator.GetDrySource()
 	d.EXPECT().EvaluateAppRevisionsChanges(mock.Anything, app, drySource, drySource.TargetRevision, proj, mock.Anything).
 		Return(false, "new-dry-sha", nil).Once()
+	expectNoteAdvanceGuard(d, app, proj, "new-dry-sha", false)
 
 	// The controller must fetch write credentials for the destination repo.
 	destRepo := &v1alpha1.Repository{Repo: app.Spec.GetHydrateToSource().RepoURL}
@@ -2063,10 +2087,11 @@ func TestProcessAppHydrateQueueItem_NoteAdvance_NoCommitCreated(t *testing.T) {
 	}
 	app.Status.SourceHydrator.LastComparedDryRevision = "new-sha"
 
-	d.EXPECT().GetProcessableAppProj(mock.Anything).Return(proj, nil).Once()
+	d.EXPECT().GetProcessableAppProj(mock.Anything).Return(proj, nil).Times(2)
 	drySource := app.Spec.SourceHydrator.GetDrySource()
 	d.EXPECT().EvaluateAppRevisionsChanges(mock.Anything, app, drySource, drySource.TargetRevision, proj, mock.Anything).
 		Return(false, "new-sha", nil).Once()
+	expectNoteAdvanceGuard(d, app, proj, "new-sha", false)
 
 	destRepo := &v1alpha1.Repository{Repo: app.Spec.GetHydrateToSource().RepoURL}
 	d.EXPECT().GetWriteCredentials(mock.Anything, app.Spec.GetHydrateToSource().RepoURL, app.Spec.Project).
@@ -2122,10 +2147,11 @@ func TestProcessAppHydrateQueueItem_NoteAdvance_StatusUpdatedCorrectly(t *testin
 	}
 	app.Status.SourceHydrator.LastComparedDryRevision = "dry-v2"
 
-	d.EXPECT().GetProcessableAppProj(mock.Anything).Return(proj, nil).Once()
+	d.EXPECT().GetProcessableAppProj(mock.Anything).Return(proj, nil).Times(2)
 	drySource := app.Spec.SourceHydrator.GetDrySource()
 	d.EXPECT().EvaluateAppRevisionsChanges(mock.Anything, app, drySource, drySource.TargetRevision, proj, mock.Anything).
 		Return(false, "dry-v2", nil).Once()
+	expectNoteAdvanceGuard(d, app, proj, "dry-v2", false)
 
 	destRepo := &v1alpha1.Repository{Repo: app.Spec.GetHydrateToSource().RepoURL}
 	d.EXPECT().GetWriteCredentials(mock.Anything, app.Spec.GetHydrateToSource().RepoURL, app.Spec.Project).
@@ -2172,4 +2198,107 @@ func TestProcessAppHydrateQueueItem_NoteAdvance_StatusUpdatedCorrectly(t *testin
 
 	// LastComparedDryRevision
 	assert.Equal(t, "dry-v2", noteAdvanceStatus.LastComparedDryRevision)
+}
+
+// expectNoteAdvanceGuard mocks canAdvanceHydratorNote's comparison against the last hydrated revision
+// and its hydration-group lookup.
+func expectNoteAdvanceGuard(d *mocks.Dependencies, app *v1alpha1.Application, proj *v1alpha1.AppProject, resolved string, hasChanges bool) {
+	hydrated := app.Status.SourceHydrator.LastSuccessfulOperation.DrySHA
+	d.EXPECT().EvaluateAppRevisionsChanges(mock.Anything, mock.MatchedBy(func(a *v1alpha1.Application) bool {
+		return a.Status.SourceHydrator.LastComparedDryRevision == hydrated
+	}), app.Spec.SourceHydrator.GetDrySource(), resolved, proj, false).Return(hasChanges, resolved, nil).Once()
+	if !hasChanges {
+		d.EXPECT().GetProcessableApps().Return(&v1alpha1.ApplicationList{Items: []v1alpha1.Application{*app}}, nil).Once()
+	}
+}
+
+func newNoteAdvanceTestApp(phase v1alpha1.HydrateOperationPhase) *v1alpha1.Application {
+	app := newTestApp("test-app")
+	app.Status.SourceHydrator.LastSuccessfulOperation = &v1alpha1.SuccessfulHydrateOperation{
+		DrySHA:         "hydrated-dry-sha",
+		HydratedSHA:    "hydrated-sha",
+		SourceHydrator: *app.Spec.SourceHydrator,
+	}
+	finishedAt := metav1.Now()
+	app.Status.SourceHydrator.CurrentOperation = &v1alpha1.HydrateOperation{
+		Phase:          phase,
+		FinishedAt:     &finishedAt,
+		DrySHA:         "hydrated-dry-sha",
+		HydratedSHA:    "hydrated-sha",
+		SourceHydrator: *app.Spec.SourceHydrator,
+	}
+	// A previous pass already recorded the new revision, as happens when a hydration is queued.
+	app.Status.SourceHydrator.LastComparedDryRevision = "new-dry-sha"
+	return app
+}
+
+func expectNoChangesSinceLastCompared(d *mocks.Dependencies, app *v1alpha1.Application, proj *v1alpha1.AppProject, times int) {
+	d.EXPECT().GetProcessableAppProj(mock.Anything).Return(proj, nil).Times(times)
+	drySource := app.Spec.SourceHydrator.GetDrySource()
+	d.EXPECT().EvaluateAppRevisionsChanges(mock.Anything, app, drySource, drySource.TargetRevision, proj, mock.Anything).
+		Return(false, "new-dry-sha", nil).Once()
+	d.EXPECT().RemoveHydrationAnnotations(mock.Anything).Return().Once()
+}
+
+// A reconcile between queueing a hydration and running it sees "no changes" against
+// LastComparedDryRevision; the note must not attest the old commit for the changed revision.
+func TestProcessAppHydrateQueueItem_NoNoteAdvance_WhenHydrationPending(t *testing.T) {
+	t.Parallel()
+	d := mocks.NewDependencies(t)
+	proj := newTestProject()
+	app := newNoteAdvanceTestApp(v1alpha1.HydrateOperationPhaseHydrated)
+	expectNoChangesSinceLastCompared(d, app, proj, 2)
+	expectNoteAdvanceGuard(d, app, proj, "new-dry-sha", true)
+
+	h := &Hydrator{dependencies: d, commitClientset: &commitservermocks.Clientset{CommitServiceClient: commitservermocks.NewCommitServiceClient(t)}}
+	h.ProcessAppHydrateQueueItem(app)
+}
+
+func TestProcessAppHydrateQueueItem_NoNoteAdvance_WhenLastHydrationFailed(t *testing.T) {
+	t.Parallel()
+	d := mocks.NewDependencies(t)
+	proj := newTestProject()
+	app := newNoteAdvanceTestApp(v1alpha1.HydrateOperationPhaseFailed)
+	expectNoChangesSinceLastCompared(d, app, proj, 1)
+
+	h := &Hydrator{dependencies: d, commitClientset: &commitservermocks.Clientset{CommitServiceClient: commitservermocks.NewCommitServiceClient(t)}}
+	h.ProcessAppHydrateQueueItem(app)
+}
+
+func TestProcessAppHydrateQueueItem_NoNoteAdvance_WhenHydratedBranchShared(t *testing.T) {
+	t.Parallel()
+	d := mocks.NewDependencies(t)
+	proj := newTestProject()
+	app := newNoteAdvanceTestApp(v1alpha1.HydrateOperationPhaseHydrated)
+	expectNoChangesSinceLastCompared(d, app, proj, 2)
+	d.EXPECT().EvaluateAppRevisionsChanges(mock.Anything, mock.MatchedBy(func(a *v1alpha1.Application) bool {
+		return a.Status.SourceHydrator.LastComparedDryRevision == "hydrated-dry-sha"
+	}), app.Spec.SourceHydrator.GetDrySource(), "new-dry-sha", proj, false).Return(false, "new-dry-sha", nil).Once()
+	sibling := newTestApp("sibling")
+	d.EXPECT().GetProcessableApps().Return(&v1alpha1.ApplicationList{Items: []v1alpha1.Application{*app, *sibling}}, nil).Once()
+
+	h := &Hydrator{dependencies: d, commitClientset: &commitservermocks.Clientset{CommitServiceClient: commitservermocks.NewCommitServiceClient(t)}}
+	h.ProcessAppHydrateQueueItem(app)
+}
+
+// Apps with different dry sources still share the hydrated branch when the destination matches.
+func TestProcessAppHydrateQueueItem_NoNoteAdvance_WhenBranchSharedAcrossDrySources(t *testing.T) {
+	t.Parallel()
+	d := mocks.NewDependencies(t)
+	proj := newTestProject()
+	app := newNoteAdvanceTestApp(v1alpha1.HydrateOperationPhaseHydrated)
+	expectNoChangesSinceLastCompared(d, app, proj, 2)
+	d.EXPECT().EvaluateAppRevisionsChanges(mock.Anything, mock.MatchedBy(func(a *v1alpha1.Application) bool {
+		return a.Status.SourceHydrator.LastComparedDryRevision == "hydrated-dry-sha"
+	}), app.Spec.SourceHydrator.GetDrySource(), "new-dry-sha", proj, false).Return(false, "new-dry-sha", nil).Once()
+	sibling := newTestApp("sibling")
+	sibling.Spec.SourceHydrator.DrySource.RepoURL = "https://example.com/other-dry-repo"
+	sibling.Spec.SourceHydrator.DrySource.TargetRevision = "release"
+	sibling.Spec.SourceHydrator.SyncSource.RepoURL = app.Spec.GetHydrateToSource().RepoURL
+	require.Equal(t, app.Spec.GetHydrateToSource(), sibling.Spec.GetHydrateToSource())
+	require.NotEqual(t, getHydrationQueueKey(app), getHydrationQueueKey(sibling))
+	d.EXPECT().GetProcessableApps().Return(&v1alpha1.ApplicationList{Items: []v1alpha1.Application{*app, *sibling}}, nil).Once()
+
+	h := &Hydrator{dependencies: d, commitClientset: &commitservermocks.Clientset{CommitServiceClient: commitservermocks.NewCommitServiceClient(t)}}
+	h.ProcessAppHydrateQueueItem(app)
 }

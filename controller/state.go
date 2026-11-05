@@ -505,7 +505,7 @@ func (m *appStateManager) evaluateRevisionChanges(ctx context.Context, app *v1al
 
 	keyManifestGenerateAnnotationVal := app.Annotations[v1alpha1.AnnotationKeyManifestGeneratePaths]
 
-	if syncedRevision != "" && repo.Depth == 0 && keyManifestGenerateAnnotationVal != "" {
+	if syncedRevision != "" && keyManifestGenerateAnnotationVal != "" {
 		updateRevisionResult, err := repoClient.UpdateRevisionForPaths(ctx, &apiclient.UpdateRevisionForPathsRequest{
 			Repo:               repo,
 			Revision:           revision,
@@ -924,20 +924,13 @@ func (m *appStateManager) CompareAppState(ctx context.Context, app *v1alpha1.App
 		manifestRevisions = append(manifestRevisions, manifestInfo.Revision)
 	}
 
-	serverSideDiff := m.serverSideDiff ||
-		resourceutil.HasAnnotationOption(app, common.AnnotationCompareOptions, "ServerSideDiff=true")
-
-	// This allows turning SSD off for a given app if it is enabled at the
-	// controller level
-	if resourceutil.HasAnnotationOption(app, common.AnnotationCompareOptions, "ServerSideDiff=false") {
-		serverSideDiff = false
-	}
+	serverSideDiff := shouldUseServerSideDiff(app, m.serverSideDiff)
 
 	useDiffCache := useDiffCache(noCache, manifestInfos, sources, app, manifestRevisions, m.statusRefreshTimeout, serverSideDiff, logCtx)
 
 	diffConfigBuilder := argodiff.NewDiffConfigBuilder().
 		WithDiffSettings(app.Spec.IgnoreDifferences, resourceOverrides, compareOptions.IgnoreAggregatedRoles, m.ignoreNormalizerOpts).
-		WithTracking(appLabelKey, string(trackingMethod))
+		WithTracking(appLabelKey, trackingMethod)
 
 	if useDiffCache {
 		diffConfigBuilder.WithCache(m.cache, app.InstanceName(m.namespace))
@@ -967,11 +960,6 @@ func (m *appStateManager) CompareAppState(ctx context.Context, app *v1alpha1.App
 			defer cleanup()
 			diffConfigBuilder.WithServerSideDryRunner(diff.NewK8sServerSideDryRunner(applier))
 		}
-	}
-
-	// enable structured merge diff if application syncs with server-side apply
-	if app.Spec.SyncPolicy != nil && app.Spec.SyncPolicy.SyncOptions.HasOption("ServerSideApply=true") {
-		diffConfigBuilder.WithStructuredMergeDiff(true)
 	}
 
 	// it is necessary to ignore the error at this point to avoid creating duplicated
@@ -1186,6 +1174,20 @@ func (m *appStateManager) CompareAppState(ctx context.Context, app *v1alpha1.App
 	ts.AddCheckpoint("health_ms")
 	compRes.timings = ts.Timings()
 	return &compRes, nil
+}
+
+// shouldUseServerSideDiff returns whether Server-Side Diff should be used for
+// the given application. It is enabled by the controller-level flag, the
+// `ServerSideDiff=true` compare-option annotation, or the `ServerSideApply=true`
+// sync option (which supersedes the discontinued Structured-Merge Diff strategy).
+// An explicit `ServerSideDiff=false` annotation always disables it.
+func shouldUseServerSideDiff(app *v1alpha1.Application, controllerLevelSSD bool) bool {
+	if resourceutil.HasAnnotationOption(app, common.AnnotationCompareOptions, "ServerSideDiff=false") {
+		return false
+	}
+	return controllerLevelSSD ||
+		resourceutil.HasAnnotationOption(app, common.AnnotationCompareOptions, "ServerSideDiff=true") ||
+		(app.Spec.SyncPolicy != nil && app.Spec.SyncPolicy.SyncOptions.HasOption("ServerSideApply=true"))
 }
 
 // useDiffCache will determine if the diff should be calculated based
